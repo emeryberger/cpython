@@ -43,6 +43,11 @@
 #  include <sys/time.h>           // setitimer()
 #endif
 
+#define PY_SSIZE_T_CLEAN
+#include <frameobject.h>
+#include <execinfo.h>
+#include <string.h>
+
 #if defined(HAVE_PTHREAD_SIGMASK) && !defined(HAVE_BROKEN_PTHREAD_SIGMASK)
 #  define PYPTHREAD_SIGMASK
 #endif
@@ -267,9 +272,141 @@ report_wakeup_send_error(void* data)
 }
 #endif   /* MS_WINDOWS */
 
+static __thread PyObject *frame_summaries = NULL;
+
+static void init_frame_summaries_if_needed() {
+    if (!frame_summaries) {
+        frame_summaries = PyList_New(0);
+        if (!frame_summaries) {
+            PyErr_NoMemory();
+            return;
+        }
+    }
+}
+
+static void add_frame_summary(const char *backtrace_line) {
+    PyGILState_STATE gstate = PyGILState_Ensure();
+
+    init_frame_summaries_if_needed();
+    if (!frame_summaries) {
+        PyGILState_Release(gstate);
+        return;
+    }
+
+    // Parse the backtrace line to extract the filename and function name
+    char filename[1024] = {0};
+    char func_name[256] = {0};
+    if (sscanf(backtrace_line, "%*d %1023s %*x %255[^+ ]", filename, func_name) != 2) {
+        PyGILState_Release(gstate);
+        return;
+    }
+
+    // Import the FrameSummary class from the traceback module
+    PyObject *traceback_module = PyImport_ImportModule("traceback");
+    if (!traceback_module) {
+        PyGILState_Release(gstate);
+        return;
+    }
+
+    PyObject *FrameSummary = PyObject_GetAttrString(traceback_module, "FrameSummary");
+    Py_DECREF(traceback_module);
+    if (!FrameSummary) {
+        PyGILState_Release(gstate);
+        return;
+    }
+
+    // Create a FrameSummary object with the extracted information
+    PyObject *summary = PyObject_CallFunction(FrameSummary, "sOs", filename, Py_None, func_name);
+    Py_DECREF(FrameSummary);
+
+    if (!summary) {
+        PyGILState_Release(gstate);
+        return;
+    }
+
+    PyList_Append(frame_summaries, summary);
+    Py_DECREF(summary);
+
+    PyGILState_Release(gstate);
+}
+
+static PyObject *get_frame_summaries(PyObject *self, PyObject *args) {
+    PyGILState_STATE gstate = PyGILState_Ensure();
+
+    init_frame_summaries_if_needed();
+    if (!frame_summaries) {
+        PyGILState_Release(gstate);
+        return NULL;
+    }
+
+    Py_INCREF(frame_summaries);
+    PyObject *result = PyList_New(PyList_Size(frame_summaries));
+    for (Py_ssize_t i = 0; i < PyList_Size(frame_summaries); i++) {
+        PyObject *item = PyList_GetItem(frame_summaries, i);
+        Py_INCREF(item);
+        PyList_SetItem(result, i, item);
+    }
+
+    PyGILState_Release(gstate);
+    return result;
+}
+
+static void free_frame_summaries() {
+    if (frame_summaries) {
+        Py_DECREF(frame_summaries);
+        frame_summaries = NULL;
+    }
+}
+
+// Method table for the module
+static PyMethodDef YourModuleMethods[] = {
+    {"get_frame_summaries", get_frame_summaries, METH_NOARGS,
+     "Return the frame summaries."},
+    {NULL, NULL, 0, NULL}        /* Sentinel */
+};
+
+// Module initialization function
+PyMODINIT_FUNC PyInit_your_module(void) {
+    PyObject *m;
+
+    m = PyModule_Create(&YourModuleMethods);
+    if (m == NULL)
+        return NULL;
+
+    return m;
+}
+
+void capture_backtrace() {
+    void *array[128];
+    size_t size = backtrace(array, 128);
+    char **strings = backtrace_symbols(array, size);
+    
+    for (size_t j = 0; j < size; j++) {
+        add_frame_summary(strings[j]);
+    }
+    
+    free(strings);
+}
+
+
 static void
 trip_signal(int sig_num)
 {
+  const int array_length = 128;
+  void *array[array_length];
+  char **strings;
+  size_t size;
+
+  // get void*'s for all entries on the stack
+  size = backtrace(array, array_length);
+
+  strings = backtrace_symbols(array, size);
+  for (size_t j = 0; j < size; j++) {
+    add_frame_summary(strings[j]);
+    //    add_traceback_entry(strings[j]);
+    // fprintf(stderr, "%s\n", strings[j]);
+  }
+  
     _Py_atomic_store_int(&Handlers[sig_num].tripped, 1);
 
     /* Set is_tripped after setting .tripped, as it gets
@@ -1359,6 +1496,8 @@ static PyMethodDef signal_methods[] = {
 #if defined(HAVE_SIGFILLSET) || defined(MS_WINDOWS)
     SIGNAL_VALID_SIGNALS_METHODDEF
 #endif
+    {"get_native_traceback", get_frame_summaries, METH_NOARGS,
+     "Return the native traceback list."},
     {NULL, NULL}           /* sentinel */
 };
 
