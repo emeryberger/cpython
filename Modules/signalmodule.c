@@ -1,4 +1,18 @@
 
+
+/*
+
+https://stackoverflow.com/questions/27842377/building-libunwind-for-mac
+
+https://stackoverflow.com/questions/59013694/how-to-get-line-numbers-same-as-lldb-using-atos-addr2line-llvm-symbolizer-lldb-i
+https://stackoverflow.com/questions/10242766/atos-and-dwarfdump-wont-symbolicate-my-address
+https://www.jamiegrove.com/software/fixing-bugs-using-os-x-crash-logs-and-atos-to-symbolicate-and-find-line-numbers
+https://developer.apple.com/videos/play/wwdc2021/10211/
+
+  
+ */
+
+
 /* Signal module -- many thanks to Lance Ellinghaus */
 
 /* XXX Signals should be recorded per thread, now we have thread state. */
@@ -47,6 +61,8 @@
 #include <frameobject.h>
 #include <execinfo.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #if defined(HAVE_PTHREAD_SIGMASK) && !defined(HAVE_BROKEN_PTHREAD_SIGMASK)
 #  define PYPTHREAD_SIGMASK
@@ -296,11 +312,24 @@ static void add_frame_summary(const char *backtrace_line) {
     // Parse the backtrace line to extract the filename and function name
     char filename[1024] = {0};
     char func_name[256] = {0};
-    if (sscanf(backtrace_line, "%*d %1023s %*x %255[^+ ]", filename, func_name) != 2) {
+    // The line number here is actually the offset, which we will decode later to convert to the true line number.
+    unsigned long line_number;
+    unsigned long address;
+    int frame_number;
+    int offset;
+    printf("FIXME BACKTRACE LINE: (%s)\n", backtrace_line);
+    if (sscanf(backtrace_line, "%d %1023s %lx %255s + %d", &frame_number, filename, &address, func_name, &offset) != 5) {
         PyGILState_Release(gstate);
         return;
     }
-
+    line_number = offset;
+    printf("FILENAME %s, func_name %s, address %lx, line_number %lu\n",
+	   filename, func_name, address, line_number);
+    // line_number += address;
+    // FIXME
+    line_number = address;
+    printf("FIXME SUCCESSFUL PARSE (%lu) (%lu)\n", address, line_number);
+    
     // Import the FrameSummary class from the traceback module
     PyObject *traceback_module = PyImport_ImportModule("traceback");
     if (!traceback_module) {
@@ -316,7 +345,10 @@ static void add_frame_summary(const char *backtrace_line) {
     }
 
     // Create a FrameSummary object with the extracted information
-    PyObject *summary = PyObject_CallFunction(FrameSummary, "sOs", filename, Py_None, func_name);
+    printf("line_number as int = %d\n", line_number);
+    PyObject * line_number_obj = PyLong_FromUnsignedLong(line_number);
+    PyObject *summary = PyObject_CallFunction(FrameSummary, "sOs", filename, line_number_obj, func_name);
+    Py_DECREF(line_number_obj);
     Py_DECREF(FrameSummary);
 
     if (!summary) {
@@ -330,7 +362,7 @@ static void add_frame_summary(const char *backtrace_line) {
     PyGILState_Release(gstate);
 }
 
-static PyObject *get_frame_summaries(PyObject *self, PyObject *args) {
+static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
     PyGILState_STATE gstate = PyGILState_Ensure();
 
     init_frame_summaries_if_needed();
@@ -341,12 +373,84 @@ static PyObject *get_frame_summaries(PyObject *self, PyObject *args) {
 
     Py_INCREF(frame_summaries);
     PyObject *result = PyList_New(PyList_Size(frame_summaries));
+#if 0
     for (Py_ssize_t i = 0; i < PyList_Size(frame_summaries); i++) {
         PyObject *item = PyList_GetItem(frame_summaries, i);
         Py_INCREF(item);
         PyList_SetItem(result, i, item);
     }
+#else
+    for (Py_ssize_t i = 0; i < PyList_Size(frame_summaries); i++) {
+      PyObject *item = PyList_GetItem(frame_summaries, i);
+      PyObject *filename_obj = PyObject_GetAttrString(item, "filename");
+      PyObject *func_name_obj = PyObject_GetAttrString(item, "name");
+      PyObject *line_number_obj = PyObject_GetAttrString(item, "lineno");
 
+      if (!PyUnicode_Check(filename_obj) || !PyUnicode_Check(func_name_obj) || !PyLong_Check(line_number_obj)) {
+        // Handle error
+        continue;
+      }
+
+      const char *filename = PyUnicode_AsUTF8(filename_obj);
+      long line_number = PyLong_AsLong(line_number_obj);
+
+      char command[1024];
+
+#ifdef __APPLE__
+      // macOS specific command using atos
+      snprintf(command, sizeof(command), "atos -o %s %lx", filename, line_number);
+#else
+      // Other systems using addr2line
+      snprintf(command, sizeof(command), "addr2line -e %s %lx", filename, line_number);
+#endif
+      printf("command = %s\n", command);
+      
+      FILE *fp = popen(command, "r");
+      if (fp == NULL) {
+        // Handle error
+        continue;
+      }
+
+      char output_line[256];
+      char resolved_file[256];
+      int resolved_line = -1; // Error case
+      if (fgets(output_line, sizeof(output_line), fp) != NULL) {
+#ifdef __APPLE__
+	printf("FIXME GOT ME A LINE [%s]\n", output_line);
+        // Parse the output for macOS atos
+        // Adjust the parsing logic according to the output format of atos
+        // Example: sscanf(output_line, "%255s (in %*s) (at %d)", resolved_file, &resolved_line);
+	if (sscanf(output_line, "%255[^+]+ %d\n", resolved_file, &resolved_line) == 2) {
+	  // if (sscanf(output_line, "%255[^:]:%d", resolved_file, &resolved_line) == 2) {
+	  printf("YO YO\n");
+            PyObject *new_lineno_obj = PyLong_FromLong(resolved_line);
+            if (new_lineno_obj) {
+                PyObject_SetAttrString(item, "lineno", new_lineno_obj);
+                Py_DECREF(new_lineno_obj);
+            }
+        }
+#else
+        // Parse the output for addr2line
+        if (sscanf(output_line, "%255s at %d", resolved_file, &resolved_line) == 2) {
+	  PyObject *new_lineno_obj = PyLong_FromLong(resolved_line);
+	  if (new_lineno_obj) {
+	    PyObject_SetAttrString(item, "lineno", new_lineno_obj);
+	    Py_DECREF(new_lineno_obj);
+	  }
+        }
+#endif
+      }
+
+      pclose(fp);
+
+      Py_DECREF(filename_obj);
+      Py_DECREF(func_name_obj);
+      Py_DECREF(line_number_obj);
+
+      Py_INCREF(item);
+      PyList_SetItem(result, i, item);
+    }
+#endif
     PyGILState_Release(gstate);
     return result;
 }
@@ -360,7 +464,7 @@ static void free_frame_summaries() {
 
 // Method table for the module
 static PyMethodDef YourModuleMethods[] = {
-    {"get_frame_summaries", get_frame_summaries, METH_NOARGS,
+    {"get_native_traceback", get_native_traceback, METH_NOARGS,
      "Return the frame summaries."},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
@@ -1496,7 +1600,7 @@ static PyMethodDef signal_methods[] = {
 #if defined(HAVE_SIGFILLSET) || defined(MS_WINDOWS)
     SIGNAL_VALID_SIGNALS_METHODDEF
 #endif
-    {"get_native_traceback", get_frame_summaries, METH_NOARGS,
+    {"get_native_traceback", get_native_traceback, METH_NOARGS,
      "Return the native traceback list."},
     {NULL, NULL}           /* sentinel */
 };
