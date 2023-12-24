@@ -289,6 +289,41 @@ report_wakeup_send_error(void* data)
 #endif   /* MS_WINDOWS */
 
 static __thread PyObject *frame_summaries = NULL;
+static __thread PyListObject *thread_local_frames = NULL;
+
+void collect_python_frames() {
+    PyGILState_STATE gstate;
+    gstate = PyGILState_Ensure();
+
+    PyThreadState *tstate = PyThreadState_Get();
+
+    PyFrameObject * frame = PyThreadState_GetFrame(tstate); // PyEval_GetFrame();
+
+
+    if (thread_local_frames == NULL) {
+        thread_local_frames = (PyListObject *)PyList_New(0);
+    }
+
+    while (frame != NULL) {
+      printf("APPENDING FRAME %s\n", PyFrame_GetCode(frame));
+        PyList_Append((PyObject *)thread_local_frames, (PyObject *)frame);
+        Py_INCREF(frame); // Increase reference count
+        frame = frame->f_back;
+    }
+
+    PyGILState_Release(gstate);
+}
+
+
+static PyObject* get_frames(PyObject *self, PyObject *args) {
+    if (thread_local_frames == NULL) {
+        return PyList_New(0);
+    }
+
+    Py_INCREF(thread_local_frames); // Return a new reference
+    return (PyObject *)thread_local_frames;
+}
+
 
 static void init_frame_summaries_if_needed() {
     if (!frame_summaries) {
@@ -394,6 +429,7 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
       const char *filename = PyUnicode_AsUTF8(filename_obj);
       long line_number = PyLong_AsLong(line_number_obj);
 
+#if 0
       char command[1024];
 
 #ifdef __APPLE__
@@ -446,7 +482,8 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
       Py_DECREF(filename_obj);
       Py_DECREF(func_name_obj);
       Py_DECREF(line_number_obj);
-
+#endif
+      
       Py_INCREF(item);
       PyList_SetItem(result, i, item);
     }
@@ -462,36 +499,6 @@ static void free_frame_summaries() {
     }
 }
 
-// Method table for the module
-static PyMethodDef YourModuleMethods[] = {
-    {"get_native_traceback", get_native_traceback, METH_NOARGS,
-     "Return the frame summaries."},
-    {NULL, NULL, 0, NULL}        /* Sentinel */
-};
-
-// Module initialization function
-PyMODINIT_FUNC PyInit_your_module(void) {
-    PyObject *m;
-
-    m = PyModule_Create(&YourModuleMethods);
-    if (m == NULL)
-        return NULL;
-
-    return m;
-}
-
-void capture_backtrace() {
-    void *array[128];
-    size_t size = backtrace(array, 128);
-    char **strings = backtrace_symbols(array, size);
-    
-    for (size_t j = 0; j < size; j++) {
-        add_frame_summary(strings[j]);
-    }
-    
-    free(strings);
-}
-
 
 static void
 trip_signal(int sig_num)
@@ -501,6 +508,8 @@ trip_signal(int sig_num)
   char **strings;
   size_t size;
 
+  collect_python_frames();
+  
   // get void*'s for all entries on the stack
   size = backtrace(array, array_length);
 
@@ -1602,6 +1611,8 @@ static PyMethodDef signal_methods[] = {
 #endif
     {"get_native_traceback", get_native_traceback, METH_NOARGS,
      "Return the native traceback list."},
+    {"get_frames", get_frames, METH_NOARGS,
+     "Return the Python traceback list."},
     {NULL, NULL}           /* sentinel */
 };
 
