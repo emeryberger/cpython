@@ -291,7 +291,7 @@ report_wakeup_send_error(void* data)
 static __thread PyObject *frame_summaries = NULL;
 static __thread PyListObject *thread_local_frames = NULL;
 
-void collect_python_frames() {
+void collect_python_frames(void) {
     PyGILState_STATE gstate;
     gstate = PyGILState_Ensure();
 
@@ -305,10 +305,11 @@ void collect_python_frames() {
     }
 
     while (frame != NULL) {
-      printf("APPENDING FRAME %s\n", PyFrame_GetCode(frame));
+      printf("APPENDING FRAME %p\n", PyFrame_GetCode(frame));
+      printf("LINE NUMBER = %ld\n", PyFrame_GetLineNumber(frame));
         PyList_Append((PyObject *)thread_local_frames, (PyObject *)frame);
         Py_INCREF(frame); // Increase reference count
-        frame = frame->f_back;
+        frame = PyFrame_GetBack(frame);
     }
 
     PyGILState_Release(gstate);
@@ -325,7 +326,7 @@ static PyObject* get_frames(PyObject *self, PyObject *args) {
 }
 
 
-static void init_frame_summaries_if_needed() {
+static void init_frame_summaries_if_needed(void) {
     if (!frame_summaries) {
         frame_summaries = PyList_New(0);
         if (!frame_summaries) {
@@ -428,7 +429,7 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
 
       const char *filename = PyUnicode_AsUTF8(filename_obj);
       long line_number = PyLong_AsLong(line_number_obj);
-
+      printf("FIXME filename=%s, line_number=%ld\n", filename, line_number);
 #if 0
       char command[1024];
 
@@ -492,7 +493,7 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
     return result;
 }
 
-static void free_frame_summaries() {
+static void free_frame_summaries(void) {
     if (frame_summaries) {
         Py_DECREF(frame_summaries);
         frame_summaries = NULL;
