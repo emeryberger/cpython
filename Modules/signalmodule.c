@@ -379,7 +379,8 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
     PyErr_NoMemory();
     return NULL;
   }
-  for (size_t j = 0; j < native_stackframe_info[sig].size; j++) {
+  /* Skip first three frames, which are captured for every signal. */
+  for (size_t j = 3; j < native_stackframe_info[sig].size; j++) {
     add_frame_summary(sig, strings[j], frame_summaries);
   }
   return frame_summaries;
