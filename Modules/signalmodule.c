@@ -24,6 +24,7 @@
 #  include <unistd.h>             // alarm()
 #endif
 #ifdef MS_WINDOWS
+#  include <dbginfo.h>
 #  ifdef HAVE_PROCESS_H
 #    include <process.h>
 #  endif
@@ -129,13 +130,15 @@ typedef struct {
 } _signal_module_state;
 
 /* Backtrace information for native stack frames */
+#define MAX_FILENAME_LENGTH 1024
+#define MAX_FUNCTION_NAME_LENGTH 256
 #define NATIVE_STACKFRAME_MAX_LENGTH 128
+
 typedef struct {
   void * array[NATIVE_STACKFRAME_MAX_LENGTH];
   size_t size;
   bool trace;
 } _native_stackframe_info;
-
 static _native_stackframe_info native_stackframe_info[NSIG];
 
 
@@ -284,19 +287,61 @@ report_wakeup_send_error(void* data)
 #endif   /* MS_WINDOWS */
 
 
+static void parse_backtrace_line(const char* backtrace_line, char* filename, char* func_name, unsigned long *address) {
+    // Initialize with default values
+    strcpy(filename, "");
+    //    strcpy(func_name, "<none>");
+    *address = 0;
+
+    char *left_paren, *right_paren, *plus_sign, *space;
+    int frame_number;
+    
+    // Try parsing macOS X format
+    if (sscanf(backtrace_line, "%d %1023s 0x%lx %255s", &frame_number, filename, address, func_name) == 4) {
+        // Parsed as macOS X format, function directly stored in func_name
+    } else {
+        // Extract the address for Linux format
+        sscanf(strrchr(backtrace_line, '['), "[0x%lx]", address);
+
+        // Copy the part before the address into filename
+        space = strrchr(backtrace_line, ' ');
+        strncpy(filename, backtrace_line, space - backtrace_line);
+        filename[space - backtrace_line] = '\0';
+
+        // Check for function name and offset in Linux format
+        left_paren = strchr(filename, '(');
+        if (left_paren) {
+            right_paren = strchr(filename, ')');
+            *left_paren = '\0'; // End the filename before the parenthesis
+
+            plus_sign = strchr(left_paren + 1, '+');
+            if (plus_sign) {
+                // Copy function name up to the plus sign
+                strncpy(func_name, left_paren + 1, plus_sign - left_paren - 1);
+                func_name[plus_sign - left_paren - 1] = '\0';
+            } else {
+                // Copy the entire string within parentheses
+                strncpy(func_name, left_paren + 1, right_paren - left_paren - 1);
+                func_name[right_paren - left_paren - 1] = '\0';
+            }
+        }
+    }
+}
+
 static void add_frame_summary(int sig, const char *backtrace_line, PyObject * frame_summaries) {
     PyGILState_STATE gstate = PyGILState_Ensure();
 
-    char filename[1024] = {0};
-    char func_name[256] = {0};
+    char filename[MAX_FILENAME_LENGTH] = {0};
+    char func_name[MAX_FUNCTION_NAME_LENGTH] = {0};
     // The line number here is actually the offset, which we will decode later to convert to the true line number.
     unsigned long line_number;
     unsigned long address;
-    int frame_number;
-    int offset;
-    if (sscanf(backtrace_line, "%d %1023s %lx %255s + %d", &frame_number, filename, &address, func_name, &offset) != 5) {
-        PyGILState_Release(gstate);
-        return;
+    unsigned long offset = 0;
+    printf("backtrace_line = %s\n", backtrace_line);
+    parse_backtrace_line(backtrace_line, filename, func_name, &address);
+    if (!filename) {
+      PyGILState_Release(gstate);
+      return;
     }
     line_number = offset;
     // line_number += address;
@@ -319,6 +364,7 @@ static void add_frame_summary(int sig, const char *backtrace_line, PyObject * fr
 
     // Create a FrameSummary object with the extracted information
     //    PyObject * line_number_obj = PyLong_FromUnsignedLong(line_number);
+    printf("ADD_SUMMARY %s %d %s\n", filename, 0, func_name);
     PyObject *summary = PyObject_CallFunction(FrameSummary, "sis", filename, 0, func_name);
     //    Py_DECREF(line_number_obj);
     Py_DECREF(FrameSummary);
@@ -335,11 +381,13 @@ static void add_frame_summary(int sig, const char *backtrace_line, PyObject * fr
 }
 
 static PyObject *enable_native_traceback(PyObject *self, PyObject *args) {
+  printf("ENABLE NATIVE TRACEBACK\n");
     int signal_num;
     PyObject *enable_obj = Py_True;
     if (!PyArg_ParseTuple(args, "i|O", &signal_num, &enable_obj)) {
         return NULL; // Argument parsing failed
     }
+    printf("ENABLE TRACEBACK ON %d\n", signal_num);
 
     if (signal_num <= 0 || signal_num >= NSIG) {
         PyErr_SetString(PyExc_ValueError, "Invalid signal number");
@@ -358,6 +406,14 @@ static PyObject *enable_native_traceback(PyObject *self, PyObject *args) {
 
 
 static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
+  
+#ifdef MS_WINDOWS
+  // Use process ID plus a magic number to avoid clashing with debuggers
+  static bool initialized = SymInitialize(GetProcessId() + 42, NULL, true);
+  // Lazily load libraries and get line number info
+  static DWORD options = SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+#endif
+  
   int sig;
   
   if (!PyArg_ParseTuple(args, "i", &sig)) {
@@ -368,12 +424,31 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_ValueError, "Invalid signal number");
     return NULL;
   }
-    
+
   char **strings;
+  
+#ifdef MS_WINDOWS
+  strings = (char **) malloc(sizeof(char *) * NATIVE_STACKFRAME_MAX_LENGTH);
+  const int symbol_info_length = sizeof(SYMBOL_INFO) + (MAX_FILENAME_LENGTH + MAX_FUNCTION_NAME_LENGTH + 16 - 1) * sizeof(TCHAR); // 16 is magic number FIXME
+  for (int i = 0; i < native_stackframe_info[sig].size; i++) {
+    SYMBOL_INFO * symbol_info_ptr = (SYMBOL_INFO *) malloc(symbol_info_length);
+    symbol_info_ptr->SizeOfStruct = sizeof(SYMBOL_INFO);
+    symbol_info_ptr->MaxNameLen = MAX_FILENAME_LENGTH + MAX_FUNCTION_NAME_LENGTH;
+    bool res = SymFromAddr(GetProcessId() + 42,
+			   native_stackframe_info[sig].array[i],
+			   0,
+			   symbol_info_ptr);
+    printf("[%d] %s\n", i, symbol_info_ptr->Name);
+  }
+  // Currently leaks, this is just for testing for now FIXME
+  return Py_None;
+#else
 
   strings = backtrace_symbols(native_stackframe_info[sig].array,
 			      native_stackframe_info[sig].size);
+#endif
 
+  printf("TRACEBACK WOOT sz=%d\n", native_stackframe_info[sig].size);
   PyObject * frame_summaries = PyList_New(0);
   if (!frame_summaries) {
     PyErr_NoMemory();
@@ -392,7 +467,11 @@ trip_signal(int sig_num)
 {
   if (native_stackframe_info[sig_num].trace) {
     // get void*'s for all entries on the stack
+#ifdef MS_WINDOWS
+    native_stackframe_info[sig_num].size = CaptureStackBackTrace(0, NATIVE_STACKFRAME_MAX_LENGTH, native_stackframe_info[sig_num].array);
+#else
     native_stackframe_info[sig_num].size = backtrace(native_stackframe_info[sig_num].array, NATIVE_STACKFRAME_MAX_LENGTH);
+#endif
   }
  
     _Py_atomic_store_int(&Handlers[sig_num].tripped, 1);
