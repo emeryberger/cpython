@@ -24,7 +24,8 @@
 #  include <unistd.h>             // alarm()
 #endif
 #ifdef MS_WINDOWS
-#  include <dbginfo.h>
+#include <windows.h>
+#include <Dbghelp.h>
 #  ifdef HAVE_PROCESS_H
 #    include <process.h>
 #  endif
@@ -45,7 +46,11 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <frameobject.h>
+
+#ifndef MS_WINDOWS
 #include <execinfo.h>
+#endif
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -408,10 +413,15 @@ static PyObject *enable_native_traceback(PyObject *self, PyObject *args) {
 static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
   
 #ifdef MS_WINDOWS
-  // Use process ID plus a magic number to avoid clashing with debuggers
-  static bool initialized = SymInitialize(GetProcessId() + 42, NULL, true);
-  // Lazily load libraries and get line number info
-  static DWORD options = SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+  static bool initialized = false;
+  if (!initialized) {
+    DWORD options;
+    // Use process ID plus a magic number to avoid clashing with debuggers
+    SymInitialize(GetCurrentProcessId() + 42, NULL, true);
+    // Lazily load libraries and get line number info
+    options = SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    initialized = true;
+  }
 #endif
   
   int sig;
@@ -434,7 +444,7 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
     SYMBOL_INFO * symbol_info_ptr = (SYMBOL_INFO *) malloc(symbol_info_length);
     symbol_info_ptr->SizeOfStruct = sizeof(SYMBOL_INFO);
     symbol_info_ptr->MaxNameLen = MAX_FILENAME_LENGTH + MAX_FUNCTION_NAME_LENGTH;
-    bool res = SymFromAddr(GetProcessId() + 42,
+    bool res = SymFromAddr(GetCurrentProcessId() + 42,
 			   native_stackframe_info[sig].array[i],
 			   0,
 			   symbol_info_ptr);
@@ -468,7 +478,7 @@ trip_signal(int sig_num)
   if (native_stackframe_info[sig_num].trace) {
     // get void*'s for all entries on the stack
 #ifdef MS_WINDOWS
-    native_stackframe_info[sig_num].size = CaptureStackBackTrace(0, NATIVE_STACKFRAME_MAX_LENGTH, native_stackframe_info[sig_num].array);
+    native_stackframe_info[sig_num].size = CaptureStackBackTrace(0, NATIVE_STACKFRAME_MAX_LENGTH, native_stackframe_info[sig_num].array, NULL);
 #else
     native_stackframe_info[sig_num].size = backtrace(native_stackframe_info[sig_num].array, NATIVE_STACKFRAME_MAX_LENGTH);
 #endif
