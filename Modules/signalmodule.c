@@ -129,9 +129,9 @@ typedef struct {
 } _signal_module_state;
 
 /* Backtrace information for native stack frames */
-static const int native_stackframe_array_length = 128;
+#define NATIVE_STACKFRAME_MAX_LENGTH 128
 typedef struct {
-  void * array[native_stackframe_array_length];
+  void * array[NATIVE_STACKFRAME_MAX_LENGTH];
   size_t size;
   bool trace;
 } _native_stackframe_info;
@@ -392,7 +392,7 @@ trip_signal(int sig_num)
 {
   if (native_stackframe_info[sig_num].trace) {
     // get void*'s for all entries on the stack
-    native_stackframe_info[sig_num].size = backtrace(native_stackframe_info[sig_num].array, native_stackframe_array_length);
+    native_stackframe_info[sig_num].size = backtrace(native_stackframe_info[sig_num].array, NATIVE_STACKFRAME_MAX_LENGTH);
   }
  
     _Py_atomic_store_int(&Handlers[sig_num].tripped, 1);
