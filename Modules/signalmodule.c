@@ -415,11 +415,13 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
 #ifdef MS_WINDOWS
   static bool initialized = false;
   if (!initialized) {
+      printf("INITIALIZING\n");
     DWORD options;
-    // Use process ID plus a magic number to avoid clashing with debuggers
-    SymInitialize(GetCurrentProcessId() + 42, NULL, true);
+    BOOL res = SymInitialize(GetCurrentProcess(), NULL, true);
+    printf("res = %d\n", res);
     // Lazily load libraries and get line number info
     options = SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    printf("options = %d\n", options);
     initialized = true;
   }
 #endif
@@ -438,17 +440,21 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
   char **strings;
   
 #ifdef MS_WINDOWS
+  printf("WINDOWS CHECKIN\n");
   strings = (char **) malloc(sizeof(char *) * NATIVE_STACKFRAME_MAX_LENGTH);
   const int symbol_info_length = sizeof(SYMBOL_INFO) + (MAX_FILENAME_LENGTH + MAX_FUNCTION_NAME_LENGTH + 16 - 1) * sizeof(TCHAR); // 16 is magic number FIXME
+  printf("symbol_info_length = %d\n", symbol_info_length);
   for (int i = 0; i < native_stackframe_info[sig].size; i++) {
     SYMBOL_INFO * symbol_info_ptr = (SYMBOL_INFO *) malloc(symbol_info_length);
-    symbol_info_ptr->SizeOfStruct = sizeof(SYMBOL_INFO);
-    symbol_info_ptr->MaxNameLen = MAX_FILENAME_LENGTH + MAX_FUNCTION_NAME_LENGTH;
-    bool res = SymFromAddr(GetCurrentProcessId() + 42,
-			   native_stackframe_info[sig].array[i],
-			   0,
-			   symbol_info_ptr);
-    printf("[%d] %s\n", i, symbol_info_ptr->Name);
+    if (symbol_info_length) {
+        symbol_info_ptr->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol_info_ptr->MaxNameLen = MAX_FILENAME_LENGTH + MAX_FUNCTION_NAME_LENGTH;
+        bool res = SymFromAddr(GetCurrentProcess(),
+            native_stackframe_info[sig].array[i],
+            0,
+            symbol_info_ptr);
+        printf("[%d] %s\n", i, symbol_info_ptr->Name);
+    }
   }
   // Currently leaks, this is just for testing for now FIXME
   return Py_None;
@@ -475,9 +481,11 @@ static PyObject *get_native_traceback(PyObject *self, PyObject *args) {
 static void
 trip_signal(int sig_num)
 {
+    printf("TRIP SIGNAL %d\n", sig_num);
   if (native_stackframe_info[sig_num].trace) {
     // get void*'s for all entries on the stack
 #ifdef MS_WINDOWS
+      printf("CAPTURING\n");
     native_stackframe_info[sig_num].size = CaptureStackBackTrace(0, NATIVE_STACKFRAME_MAX_LENGTH, native_stackframe_info[sig_num].array, NULL);
 #else
     native_stackframe_info[sig_num].size = backtrace(native_stackframe_info[sig_num].array, NATIVE_STACKFRAME_MAX_LENGTH);
